@@ -1,4 +1,4 @@
-# GeneralAgentTemplate — Dual-LLM Roleplay Agent 究极简化版
+# Dual-LLM Roleplay Agent CLI简化版
 ---
 
 ## How It Works
