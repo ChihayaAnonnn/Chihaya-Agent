@@ -1,7 +1,4 @@
-# GeneralAgentTemplate — Dual-LLM Roleplay Agent
-
-A learning project exploring agent architecture patterns. Built around a **dual-LLM roleplay system**: a fast persona model handles every turn; a background reasoning model runs concurrently, enriches context, and steers the persona's tone and behavior over time.
-
+# GeneralAgentTemplate — Dual-LLM Roleplay Agent 究极简化版
 ---
 
 ## How It Works
