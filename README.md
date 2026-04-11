@@ -13,7 +13,7 @@ User input
 ┌─────────────────────────────────────────────────────────┐
 │  AgentLoop  (persona lane)                              │
 │                                                         │
-│  1. reads PromptHolder → ## Background Guidance        │
+│  1. reads PromptHolder → ## Background Guidance         │
 │  2. builds messages (SOUL + history + guidance)         │
 │  3. single provider.chat() call → response              │
 │  4. put_nowait(snapshot) → background queue             │
