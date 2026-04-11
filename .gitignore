@@ -1,0 +1,13 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+.agent/
+*.egg-info/
+
+
+workspace/
+workspaces/
+logs/
+
+.claude/
