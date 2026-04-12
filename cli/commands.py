@@ -37,6 +37,7 @@ from session.manager import SessionManager
 
 from agent.background import BackgroundAgent, PromptHolder
 from agent.context import ContextBuilder
+from agent.factory import make_agentic_runner
 from agent.loop import AgentLoop
 from agent.memory import MemoryStore
 from agent.runner import run_agentic_loop
@@ -281,33 +282,7 @@ def roleplay(
 
 def _make_agentic_runner(workspace: Path) -> Any:
     """Build a standalone agentic runner (tools + context) for cron/heartbeat."""
-    provider = QwenProvider(api_key=_qwen_api_key())
-    context = ContextBuilder(workspace)
-    session_manager = SessionManager(workspace)
-    tools = ToolRegistry()
-    tools.register(ReadFileTool(workspace=workspace))
-    tools.register(WriteFileTool(workspace=workspace))
-
-    async def run(content: str, session_key: str = "cli:direct") -> str:
-        session = session_manager.get_or_create(session_key)
-        history = session.get_history(max_messages=20)
-        messages = context.build_messages(
-            history=history,
-            current_message=content,
-        )
-        final_content, _ = await run_agentic_loop(
-            provider=provider,
-            tools=tools,
-            messages=messages,
-            model=provider.get_default_model(),
-        )
-        result = final_content or ""
-        session.add_message("user", content)
-        session.add_message("assistant", result)
-        session_manager.save(session)
-        return result
-
-    return run
+    return make_agentic_runner(workspace, api_key=_qwen_api_key())
 
 
 cron_app = typer.Typer(help="Scheduled tasks")

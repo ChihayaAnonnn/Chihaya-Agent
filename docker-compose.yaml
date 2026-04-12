@@ -1,0 +1,17 @@
+services:
+  agent-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - DASHSCOPE_API_KEY=${DASHSCOPE_API_KEY:-}
+      # Restrict to specific origin in production, e.g. http://your-server-ip:8080
+      - CORS_ORIGINS=${CORS_ORIGINS:-*}
+    volumes:
+      # Persist user workspaces and eval results outside the container
+      - ./workspaces:/app/workspaces
+      - ./eval/results:/app/eval/results
+      - ./logs:/app/logs
+    restart: unless-stopped
