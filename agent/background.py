@@ -4,7 +4,7 @@ import asyncio
 import json
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from bus.events import ChatHistorySnapshot, PersonaPromptUpdate
 from providers.base import LLMProvider
@@ -17,6 +17,9 @@ from agent.subagent import SubagentManager
 from agent.tools.filesystem import ReadFileTool, WriteFileTool
 from agent.tools.registry import ToolRegistry
 from agent.tools.spawn import SpawnTool
+
+# Callback type: receives an event dict, fires-and-forgets
+OnEventCallback = Callable[[dict[str, Any]], Awaitable[None]] | None
 
 logger = logging.getLogger(__name__)
 
@@ -71,12 +74,14 @@ class BackgroundAgent:
         workspace: Path | None = None,
         model: str | None = None,
         session_manager: SessionManager | None = None,
+        on_event: "OnEventCallback" = None,
     ) -> None:
         self.queue = queue
         self.provider = provider
         self.prompt_holder = prompt_holder
         self.workspace = workspace
         self.model = model or provider.get_default_model()
+        self.on_event = on_event
         self._running = False
         self._turns_since_consolidation: dict[str, int] = {}
 
@@ -117,8 +122,18 @@ class BackgroundAgent:
             except Exception as e:
                 logger.error("[BACKGROUND] error: %s", e)
 
+    async def _emit(self, event: dict[str, Any]) -> None:
+        """Fire-and-forget event to the registered callback."""
+        if self.on_event is not None:
+            try:
+                await self.on_event(event)
+            except Exception:
+                pass
+
     async def _analyze(self, snapshot: ChatHistorySnapshot) -> PersonaPromptUpdate | None:
         logger.info("[BACKGROUND] analyzing snapshot: session=%s", snapshot.session_key)
+        await self._emit({"type": "start", "session": snapshot.session_key,
+                          "message": snapshot.current_user_message[:120]})
 
         system_prompt = BACKGROUND_SYSTEM_PROMPT
         if self.context is not None:
@@ -141,6 +156,10 @@ class BackgroundAgent:
         })
 
         logger.info("[BACKGROUND] running agentic loop")
+
+        async def _on_progress(progress: str) -> None:
+            await self._emit({"type": "tool_call", "detail": progress})
+
         final_content, tools_used = await run_agentic_loop(
             provider=self.provider,
             tools=self.tools,
@@ -149,11 +168,16 @@ class BackgroundAgent:
             max_iterations=10,
             temperature=0.3,
             max_tokens=1024,
+            on_progress=_on_progress,
         )
         if tools_used:
             logger.info("[BACKGROUND] tools used: %s", ", ".join(tools_used))
+            await self._emit({"type": "tools_used", "tools": tools_used})
 
         hint = self._extract_hint(final_content or "")
+        if hint:
+            await self._emit({"type": "hint", "hint": hint})
+        await self._emit({"type": "done", "tools_used": tools_used})
         return PersonaPromptUpdate(ephemeral_hint=hint)
 
     @staticmethod
@@ -186,6 +210,7 @@ class BackgroundAgent:
         session = self.sessions.get_or_create(session_key)
         if len(session.messages) > 0:
             logger.info("[BACKGROUND] consolidating memory for session: %s", session_key)
+            await self._emit({"type": "consolidate", "session": session_key})
             try:
                 await self.memory.consolidate(session, archive_all=False)
                 self.sessions.save(session)

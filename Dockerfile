@@ -1,11 +1,15 @@
-FROM python:3.11-slim
+FROM python:3.14-slim
 
 WORKDIR /app
+
+ENV PIP_INDEX_URL=http://mirrors.tencentyun.com/pypi/simple \
+    PIP_TRUSTED_HOST=mirrors.tencentyun.com
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY agent/ agent/
+
+COPY agent/ agent/  
 COPY api/ api/
 COPY bus/ bus/
 COPY cli/ cli/
