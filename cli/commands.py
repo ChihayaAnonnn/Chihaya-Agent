@@ -36,6 +36,7 @@ def _qwen_api_key() -> str:
 from session.manager import SessionManager
 
 from agent.background import BackgroundAgent, PromptHolder
+from agent.proactive import IdleMonitor
 from agent.context import ContextBuilder
 from agent.factory import make_agentic_runner
 from agent.loop import AgentLoop
@@ -157,6 +158,12 @@ def roleplay(
     user: str = typer.Option("default", "--user", "-u", help="User name (workspace per user)"),
     session_id: str = typer.Option(None, "--session", "-s", help="Session ID"),
     logs: bool = typer.Option(False, "--logs", help="Show runtime logs"),
+    proactive: bool = typer.Option(
+        True, "--proactive/--no-proactive", help="Enable idle-triggered proactive messages"
+    ),
+    idle_seconds: int = typer.Option(
+        300, "--idle-seconds", help="Seconds of inactivity before the agent may speak up"
+    ),
 ):
     """Interact with the agent (dual-LLM: fast persona + heavy background)."""
     workspace = _get_user_workspace(user)
@@ -171,6 +178,16 @@ def roleplay(
     prompt_holder = PromptHolder()
     session_manager = SessionManager(workspace)
 
+    idle_monitor: IdleMonitor | None = None
+    if proactive and not message:  # only in interactive mode
+        idle_monitor = IdleMonitor(
+            bus=bus,
+            provider=persona_provider,
+            workspace=workspace,
+            session_manager=session_manager,
+            idle_threshold_s=idle_seconds,
+        )
+
     agent_loop = AgentLoop(
         bus=bus,
         provider=persona_provider,
@@ -179,6 +196,7 @@ def roleplay(
         persona_provider=persona_provider,
         background_queue=background_queue,
         prompt_holder=prompt_holder,
+        idle_monitor=idle_monitor,
         ephemeral=True,
     )
     background_agent = BackgroundAgent(
@@ -214,6 +232,9 @@ def roleplay(
         async def run_interactive() -> None:
             loop_task = asyncio.create_task(agent_loop.run())
             bg_task = asyncio.create_task(background_agent.run())
+            idle_task: asyncio.Task | None = None
+            if idle_monitor is not None:
+                idle_task = asyncio.create_task(idle_monitor.run())
             turn_done = asyncio.Event()
             turn_done.set()
             turn_response: list[str] = []
@@ -224,6 +245,8 @@ def roleplay(
                         msg = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
                         if msg.metadata.get("_progress"):
                             console.print(f"  [yellow]⟳[/yellow] [dim]{msg.content}[/dim]")
+                        elif msg.metadata.get("proactive"):
+                            _print_response(f"*[主动消息]* {msg.content}")
                         elif not turn_done.is_set():
                             if msg.content:
                                 turn_response.append(msg.content)
@@ -269,8 +292,14 @@ def roleplay(
                     session_manager.archive_session(session)
                 agent_loop.stop()
                 background_agent.stop()
+                if idle_monitor is not None:
+                    idle_monitor.stop()
                 outbound_task.cancel()
-                await asyncio.gather(loop_task, bg_task, outbound_task, return_exceptions=True)
+                tasks: list[asyncio.Task] = [loop_task, bg_task, outbound_task]
+                if idle_task is not None:
+                    idle_task.cancel()
+                    tasks.append(idle_task)
+                await asyncio.gather(*tasks, return_exceptions=True)
 
         asyncio.run(run_interactive())
 
@@ -420,20 +449,29 @@ def eval_run(
     logs: bool = typer.Option(False, "--logs", help="Show runtime logs"),
 ):
     """Run evaluation against a dataset."""
-    from eval.dataset import load_longmemeval
+    from eval.dataset import load_longmemeval, load_memory_recall
     from eval.runner import run_batch, summarize
 
-    if dataset != "longmemeval":
+    if dataset == "longmemeval":
+        entries = load_longmemeval(
+            entry_id=entry_id,
+            filter_type=filter_type,
+            single_session_only=single_session,
+            limit=limit,
+        )
+    elif dataset == "memory_recall":
+        entries = load_memory_recall(limit=limit)
+        if entry_id:
+            entries = [e for e in entries if e.question_id == entry_id]
+        if filter_type:
+            entries = [e for e in entries if e.question_type == filter_type]
+    else:
         _setup_logging(verbose=logs)
-        console.print(f"[red]Unknown dataset: {dataset}. Supported: longmemeval[/red]")
+        console.print(
+            f"[red]Unknown dataset: {dataset}. "
+            f"Supported: longmemeval, memory_recall[/red]"
+        )
         raise typer.Exit(1)
-
-    entries = load_longmemeval(
-        entry_id=entry_id,
-        filter_type=filter_type,
-        single_session_only=single_session,
-        limit=limit,
-    )
     if not entries:
         _setup_logging(verbose=logs)
         console.print("[yellow]No entries matched the filters.[/yellow]")
@@ -476,6 +514,10 @@ def eval_run(
 @eval_app.command("results")
 def eval_results(
     latest: bool = typer.Option(True, "--latest/--all", help="Show only latest run"),
+    compare: int = typer.Option(
+        0, "--compare", "-c",
+        help="Compare the latest N runs side-by-side (e.g. --compare 2)",
+    ),
 ):
     """Show evaluation results."""
     if not _EVAL_RESULTS_DIR.exists():
@@ -490,13 +532,48 @@ def eval_results(
     import json as _json
     from eval.runner import EvalResult, summarize
 
+    def _load(path: Path) -> list[EvalResult]:
+        items: list[EvalResult] = []
+        for line in path.read_text(encoding="utf-8").strip().splitlines():
+            items.append(EvalResult(**_json.loads(line)))
+        return items
+
+    if compare and compare >= 2:
+        runs = files[-compare:]
+        console.print(Rule(f"[bold]Comparing {len(runs)} runs[/bold]"))
+        summaries: list[tuple[Path, dict[str, Any]]] = []
+        for f in runs:
+            summaries.append((f, summarize(_load(f))))
+
+        header = f"{'Run':<32}{'Total':>8}{'Correct':>10}{'Acc':>8}{'Errors':>8}"
+        console.print(f"[bold]{header}[/bold]")
+        for f, s in summaries:
+            console.print(
+                f"{f.name:<32}{s['total']:>8}{s['correct']:>10}"
+                f"{s['accuracy']:>7.1%}{s['errors']:>8}"
+            )
+
+        # per-type delta between first and last run
+        first, last = summaries[0][1], summaries[-1][1]
+        types = sorted(set(first["by_type"]) | set(last["by_type"]))
+        if types:
+            console.print("\n[bold]Per-type Δ (last − first)[/bold]")
+            for t in types:
+                a = first["by_type"].get(t, {"accuracy": 0.0})["accuracy"]
+                b = last["by_type"].get(t, {"accuracy": 0.0})["accuracy"]
+                delta = b - a
+                sign = "+" if delta >= 0 else ""
+                color = "green" if delta >= 0 else "red"
+                console.print(
+                    f"  {t:<20} {a:>6.1%} → {b:>6.1%}  "
+                    f"[{color}]{sign}{delta*100:.1f}pp[/{color}]"
+                )
+        return
+
     targets = [files[-1]] if latest else files
     for f in targets:
         console.print(Rule(f"[bold]{f.name}[/bold]"))
-        results = []
-        for line in f.read_text(encoding="utf-8").strip().splitlines():
-            d = _json.loads(line)
-            results.append(EvalResult(**d))
+        results = _load(f)
 
         summary = summarize(results)
         console.print(f"  Total: {summary['total']}  Correct: {summary['correct']}  "

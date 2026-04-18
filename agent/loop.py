@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import time
 from pathlib import Path
 from typing import Awaitable, Callable
 
@@ -14,6 +15,8 @@ from agent.background import PromptHolder
 from session.manager import SessionManager
 
 from agent.context import ContextBuilder
+from agent.proactive import IdleMonitor
+from utils import log_event, new_trace_id
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +47,7 @@ class AgentLoop:
         persona_provider: LLMProvider | None = None,
         background_queue: asyncio.Queue[ChatHistorySnapshot] | None = None,
         prompt_holder: PromptHolder | None = None,
+        idle_monitor: IdleMonitor | None = None,
         ephemeral: bool = False,
     ) -> None:
         self.bus = bus
@@ -51,6 +55,7 @@ class AgentLoop:
         self.provider = persona_provider or provider
         self.background_queue = background_queue
         self.prompt_holder = prompt_holder
+        self.idle_monitor = idle_monitor
         self.workspace = workspace
         self.model = model or provider.get_default_model()
         self.temperature = temperature
@@ -110,11 +115,15 @@ class AgentLoop:
         on_progress: Callable[[str], Awaitable[None]] | None = None,
     ) -> OutboundMessage | None:
         """Process a single inbound message with a single LLM call."""
+        trace_id = new_trace_id()
         preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
         logger.info("[LOOP] processing message from %s:%s: %s", msg.channel, msg.sender_id, preview)
 
         key = session_key or msg.session_key
         session = self.sessions.get_or_create(key, ephemeral=self.ephemeral)
+
+        if self.idle_monitor is not None:
+            self.idle_monitor.record_user_activity(key, msg.channel, msg.chat_id)
 
         if msg.content.strip().lower() == "/help":
             return OutboundMessage(
@@ -131,12 +140,13 @@ class AgentLoop:
                 session_key=key,
                 messages=history,
                 current_user_message=msg.content,
+                trace_id=trace_id,
             )
             self.background_queue.put_nowait(snapshot)
 
         ephemeral_hint = ""
         if self.prompt_holder is not None:
-            if update := self.prompt_holder.read():
+            if update := await self.prompt_holder.read_and_consume():
                 ephemeral_hint = update.ephemeral_hint or ""
 
         messages = self.context.build_persona_messages(
@@ -151,17 +161,30 @@ class AgentLoop:
             json.dumps(messages, ensure_ascii=False, indent=2),
         )
         # Single shot — no tools, no iteration
+        t0 = time.monotonic()
         response = await self.provider.chat(
             messages=messages,
             model=self.model,
             temperature=self.temperature,
             max_tokens=self.max_tokens,
         )
+        latency_ms = int((time.monotonic() - t0) * 1000)
         logger.info("[PERSONA] response from provider: %s", response)
         final_content = (response.content or "").strip()
 
         if not final_content:
             final_content = "..."
+
+        log_event(
+            "persona_turn",
+            trace_id=trace_id,
+            session=key,
+            channel=msg.channel,
+            latency_ms=latency_ms,
+            usage=response.usage or None,
+            ephemeral_hint=ephemeral_hint or None,
+            history_len=len(history),
+        )
 
         logger.info("[LOOP] response to %s:%s", msg.channel, msg.sender_id)
         session.add_message("user", msg.content)
@@ -172,7 +195,7 @@ class AgentLoop:
             channel=msg.channel,
             chat_id=msg.chat_id,
             content=final_content,
-            metadata=msg.metadata or {},
+            metadata={**(msg.metadata or {}), "trace_id": trace_id},
         )
 
     async def process_direct(

@@ -9,6 +9,30 @@ from agent.tools.base import Tool
 
 logger = logging.getLogger(__name__)
 
+MEMORY_WRITE_HARD_LIMIT_TOKENS = 1500
+
+
+def _is_memory_md(path: Path) -> bool:
+    """True when the resolved path points at memory/MEMORY.md inside a workspace."""
+    parts = [p.lower() for p in path.parts]
+    return (
+        path.name.upper() == "MEMORY.MD"
+        and len(parts) >= 2
+        and parts[-2] == "memory"
+    )
+
+
+def _roughly_count_tokens(text: str) -> int:
+    """Token estimator shared with memory store; tiktoken when available."""
+    if not text:
+        return 0
+    try:
+        import tiktoken
+
+        return len(tiktoken.get_encoding("cl100k_base").encode(text))
+    except Exception:
+        return int(len(text) / 2.5)
+
 
 def _resolve_path(
     path: str, workspace: Path | None = None, allowed_dir: Path | None = None
@@ -89,6 +113,19 @@ class WriteFileTool(Tool):
     async def execute(self, path: str, content: str, **kwargs: Any) -> str:
         try:
             file_path = _resolve_path(path, self._workspace, self._allowed_dir)
+
+            # Guard: MEMORY.md has a hard token budget. Refuse oversized writes
+            # and push the model to regenerate a leaner version.
+            if _is_memory_md(file_path):
+                tokens = _roughly_count_tokens(content)
+                if tokens > MEMORY_WRITE_HARD_LIMIT_TOKENS:
+                    return (
+                        f"Error: MEMORY.md write rejected — content is "
+                        f"{tokens} tokens, hard limit is "
+                        f"{MEMORY_WRITE_HARD_LIMIT_TOKENS}. Trim outdated items "
+                        f"(especially `## 最近关键决策`) and try again."
+                    )
+
             file_path.parent.mkdir(parents=True, exist_ok=True)
 
             old_content = ""
