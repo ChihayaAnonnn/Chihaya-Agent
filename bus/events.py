@@ -51,4 +51,21 @@ class ChatHistorySnapshot:
     session_key: str
     messages: list[dict[str, Any]]
     current_user_message: str
+    trace_id: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class ProactiveMessage:
+    """Agent-initiated message triggered by IdleMonitor.
+
+    Cooldown / quiet-hours state stays inside IdleMonitor; this event
+    only carries what the outbound consumer needs to render/deliver.
+    """
+
+    session_key: str
+    channel: str
+    chat_id: str
+    content: str
+    trigger_reason: str = "idle"
     metadata: dict[str, Any] = field(default_factory=dict)

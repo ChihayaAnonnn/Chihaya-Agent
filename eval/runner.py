@@ -19,7 +19,7 @@ from agent.context import ContextBuilder
 from session.manager import SessionManager
 
 from eval.dataset import EvalEntry, EvalSession, iter_turn_pairs
-from eval.judge import DEFAULT_JUDGE_MODEL, JudgeResult, llm_judge
+from eval.judge import DEFAULT_JUDGE_MODEL, JudgeResult, judge_response
 from eval.workspace import (
     cleanup_eval_workspace,
     create_eval_workspace,
@@ -172,7 +172,7 @@ async def _replay_and_answer(
     # cleared at session boundaries above).
     context = ContextBuilder(workspace)
     ephemeral_hint = ""
-    if update := prompt_holder.read():
+    if update := await prompt_holder.read_and_consume():
         ephemeral_hint = update.ephemeral_hint or ""
 
     messages = context.build_persona_messages(
@@ -189,12 +189,20 @@ async def _replay_and_answer(
     model_answer = (response.content or "").strip()
 
     # --- Judge ---
+    # When `entry.answer` is a comma-joined keyword list (self-authored
+    # memory_recall dataset), split it back so the keyword fast-path applies.
+    expected_keywords: list[str] | None = None
+    if entry.question_type in {"memory_recall", "decision_recall", "followup_recall"}:
+        kws = [k.strip() for k in entry.answer.split(",") if k.strip()]
+        expected_keywords = kws or None
+
     memory_snap = read_memory_snapshot(workspace)
-    judge_result = await llm_judge(
+    judge_result = await judge_response(
         question=entry.question,
         expected=entry.answer,
         actual=model_answer,
         provider=provider,
+        expected_keywords=expected_keywords,
         model=judge_model,
     )
 

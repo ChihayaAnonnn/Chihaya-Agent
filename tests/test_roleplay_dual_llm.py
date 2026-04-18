@@ -15,16 +15,33 @@ def _make_llm_response(content: str) -> LLMResponse:
 
 
 class TestPromptHolder(unittest.TestCase):
-    def test_read_write(self) -> None:
-        holder = PromptHolder()
-        self.assertIsNone(holder.read())
-        update = PersonaPromptUpdate(ephemeral_hint="Be more concise.")
-        asyncio.run(holder.write(update))
-        self.assertEqual(holder.read(), update)
-        update2 = PersonaPromptUpdate(ephemeral_hint="New guidance.", metadata={"v": 1})
-        asyncio.run(holder.write(update2))
-        self.assertEqual(holder.read().ephemeral_hint, "New guidance.")
-        self.assertEqual(holder.read().metadata, {"v": 1})
+    def test_write_and_consume(self) -> None:
+        async def run() -> None:
+            holder = PromptHolder()
+            self.assertIsNone(await holder.peek())
+
+            update = PersonaPromptUpdate(ephemeral_hint="Be more concise.")
+            await holder.write(update)
+            self.assertEqual(await holder.peek(), update)
+
+            update2 = PersonaPromptUpdate(ephemeral_hint="New guidance.", metadata={"v": 1})
+            await holder.write(update2)
+            peeked = await holder.peek()
+            self.assertEqual(peeked.ephemeral_hint, "New guidance.")
+            self.assertEqual(peeked.metadata, {"v": 1})
+
+        asyncio.run(run())
+
+    def test_consume_clears_value(self) -> None:
+        """read_and_consume() must return the stored update exactly once."""
+        async def run() -> None:
+            holder = PromptHolder()
+            update = PersonaPromptUpdate(ephemeral_hint="hint")
+            await holder.write(update)
+            self.assertEqual(await holder.read_and_consume(), update)
+            self.assertIsNone(await holder.read_and_consume(), "value should be cleared after consume")
+
+        asyncio.run(run())
 
 
 class TestChatHistorySnapshot(unittest.TestCase):
@@ -68,7 +85,7 @@ class TestBackgroundAgent(unittest.TestCase):
                 await task
             except asyncio.CancelledError:
                 pass
-            update = holder.read()
+            update = await holder.peek()
             self.assertIsNotNone(update)
             self.assertIn("friendly", update.ephemeral_hint)
             mock_provider.chat.assert_called()

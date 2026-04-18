@@ -109,3 +109,75 @@ def iter_turn_pairs(session: EvalSession) -> Iterator[tuple[EvalTurn, EvalTurn]]
     for i in range(0, len(turns) - 1, 2):
         if turns[i].role == "user" and turns[i + 1].role == "assistant":
             yield turns[i], turns[i + 1]
+
+
+# ---------------------------------------------------------------------------
+# Custom memory_recall dataset (hand-authored, JSONL)
+# ---------------------------------------------------------------------------
+
+_MEMORY_RECALL_PATH = Path(__file__).parent / "datasets" / "memory_recall.jsonl"
+
+_GAP_FILLER = {
+    "user": "随便再聊聊吧，最近有什么新技术值得关注？",
+    "assistant": "最近 WASI 和 MCP 都挺热。",
+}
+
+
+def load_memory_recall(
+    path: Path | None = None,
+    *,
+    limit: int | None = None,
+) -> list[EvalEntry]:
+    """Load the self-authored memory_recall.jsonl dataset.
+
+    Each line becomes a single-session EvalEntry whose session is:
+    ``setup_turns + gap_turns*N filler turns``. The ``expected_keywords``
+    field is stashed in ``question_type`` payload via a tagging convention:
+    callers that want the keywords should use :func:`load_memory_recall_raw`.
+    """
+    data_path = path or _MEMORY_RECALL_PATH
+    entries: list[EvalEntry] = []
+    with open(data_path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            raw = json.loads(line)
+            entries.append(_build_memory_recall_entry(raw))
+            if limit and len(entries) >= limit:
+                break
+    return entries
+
+
+def load_memory_recall_raw(path: Path | None = None) -> list[dict]:
+    """Return raw dicts preserving ``expected_keywords`` / ``judge_prompt``."""
+    data_path = path or _MEMORY_RECALL_PATH
+    out: list[dict] = []
+    with open(data_path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                out.append(json.loads(line))
+    return out
+
+
+def _build_memory_recall_entry(raw: dict) -> EvalEntry:
+    setup = raw.get("setup_turns", [])
+    gap = int(raw.get("gap_turns", 0))
+
+    turns: list[EvalTurn] = [
+        EvalTurn(role=t["role"], content=t["content"], has_answer=True)
+        for t in setup
+    ]
+    for _ in range(max(0, gap // 2)):
+        turns.append(EvalTurn(role="user", content=_GAP_FILLER["user"]))
+        turns.append(EvalTurn(role="assistant", content=_GAP_FILLER["assistant"]))
+
+    return EvalEntry(
+        question_id=raw["id"],
+        question_type=raw.get("type", "memory_recall"),
+        question=raw["question"],
+        answer=", ".join(raw.get("expected_keywords", []))
+        or raw.get("judge_prompt", ""),
+        sessions=[EvalSession(turns=turns)],
+    )

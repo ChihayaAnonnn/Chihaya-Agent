@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import time
 from pathlib import Path
 from typing import Any
 
@@ -11,12 +12,13 @@ from providers.base import LLMProvider
 from session.manager import SessionManager
 
 from agent.context import ContextBuilder
-from agent.memory import MemoryStore
+from agent.memory import MEMORY_MAX_TOKENS, MemoryStore
 from agent.runner import run_agentic_loop
 from agent.subagent import SubagentManager
 from agent.tools.filesystem import ReadFileTool, WriteFileTool
 from agent.tools.registry import ToolRegistry
 from agent.tools.spawn import SpawnTool
+from utils import log_event
 
 logger = logging.getLogger(__name__)
 
@@ -34,16 +36,49 @@ ways to influence it — use either, both, or neither depending on the conversat
 2. **Return an ephemeral hint** for the persona's very next turn.
    Useful for short-lived steering (tone shift, something to mention once).
 
+### Writing memory/MEMORY.md
+
+Always follow this section layout (omit a section only when truly empty):
+
+```
+## 基本信息
+(stable user profile: role, stack, timezone, language preference)
+
+## 当前进行中的项目
+(active projects with expected milestones; remove entries once done)
+
+## 重要偏好
+(communication style, technical preferences, hard constraints)
+
+## 最近关键决策
+(dated bullets, keep at most the 5 most recent)
+
+## 待跟进
+(open items to proactively surface later; remove after they are handled)
+```
+
+Rules:
+- Read the file first, then edit only the sections that changed.
+- Do NOT rewrite the whole file unless you are intentionally reorganizing.
+- Keep the whole file within ~1000 tokens. If it would exceed that, trim
+  `最近关键决策` first and move dropped items to HISTORY.md prose.
+- Never fabricate facts not present in the conversation.
+
 After using tools (or choosing not to), finish with a JSON object:
 {"ephemeral_hint": "<one sentence or empty string>"}
 
 If nothing needs updating or hinting, return {"ephemeral_hint": ""}."""
 
 MEMORY_CONSOLIDATION_THRESHOLD = 20
+BACKGROUND_ANALYZE_TIMEOUT_S = 30.0
 
 
 class PromptHolder:
-    """Shared state for PersonaPromptUpdate. Background writes, persona reads."""
+    """Shared state for PersonaPromptUpdate. Background writes, persona consumes.
+
+    Consumes are one-shot: read_and_consume() returns the current value and
+    clears it, so a stale hint cannot leak across multiple turns.
+    """
 
     def __init__(self) -> None:
         self._value: PersonaPromptUpdate | None = None
@@ -53,8 +88,17 @@ class PromptHolder:
         async with self._lock:
             self._value = update
 
-    def read(self) -> PersonaPromptUpdate | None:
-        return self._value
+    async def read_and_consume(self) -> PersonaPromptUpdate | None:
+        """Return current value and clear it atomically (once-per-turn semantics)."""
+        async with self._lock:
+            value = self._value
+            self._value = None
+            return value
+
+    async def peek(self) -> PersonaPromptUpdate | None:
+        """Read without clearing. For diagnostics/tests only."""
+        async with self._lock:
+            return self._value
 
 
 class BackgroundAgent:
@@ -109,15 +153,46 @@ class BackgroundAgent:
                 snapshot = await asyncio.wait_for(self.queue.get(), timeout=1.0)
             except asyncio.TimeoutError:
                 continue
+            t0 = time.monotonic()
             try:
-                update = await self._analyze(snapshot)
+                update = await asyncio.wait_for(
+                    self._analyze(snapshot),
+                    timeout=BACKGROUND_ANALYZE_TIMEOUT_S,
+                )
                 if update:
                     await self.prompt_holder.write(update)
                 await self._maybe_consolidate(snapshot)
+                log_event(
+                    "background_turn",
+                    trace_id=snapshot.trace_id,
+                    session=snapshot.session_key,
+                    latency_ms=int((time.monotonic() - t0) * 1000),
+                    ephemeral_hint=(update.ephemeral_hint if update else None),
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "[BACKGROUND] analyze timed out after %.1fs, session=%s",
+                    BACKGROUND_ANALYZE_TIMEOUT_S,
+                    snapshot.session_key,
+                )
+                log_event(
+                    "background_turn_timeout",
+                    trace_id=snapshot.trace_id,
+                    session=snapshot.session_key,
+                    timeout_s=BACKGROUND_ANALYZE_TIMEOUT_S,
+                )
             except Exception as e:
                 logger.error("[BACKGROUND] error: %s", e)
+                log_event(
+                    "background_turn_error",
+                    trace_id=snapshot.trace_id,
+                    session=snapshot.session_key,
+                    error=str(e),
+                )
 
-    async def _analyze(self, snapshot: ChatHistorySnapshot) -> PersonaPromptUpdate | None:
+    async def _analyze(
+        self, snapshot: ChatHistorySnapshot
+    ) -> PersonaPromptUpdate | None:
         logger.info("[BACKGROUND] analyzing snapshot: session=%s", snapshot.session_key)
 
         system_prompt = BACKGROUND_SYSTEM_PROMPT
@@ -131,14 +206,16 @@ class BackgroundAgent:
         ]
         for m in snapshot.messages[-20:]:
             messages.append({"role": m["role"], "content": m.get("content", "")})
-        messages.append({
-            "role": "user",
-            "content": (
-                f"Current user message: {snapshot.current_user_message}\n\n"
-                "Analyze the conversation. Update context files if warranted, "
-                "then return the JSON with ephemeral_hint."
-            ),
-        })
+        messages.append(
+            {
+                "role": "user",
+                "content": (
+                    f"Current user message: {snapshot.current_user_message}\n\n"
+                    "Analyze the conversation. Update context files if warranted, "
+                    "then return the JSON with ephemeral_hint."
+                ),
+            }
+        )
 
         logger.info("[BACKGROUND] running agentic loop")
         final_content, tools_used = await run_agentic_loop(
@@ -172,7 +249,7 @@ class BackgroundAgent:
             return ""
 
     async def _maybe_consolidate(self, snapshot: ChatHistorySnapshot) -> None:
-        """Consolidate session memory when message count crosses the threshold."""
+        """Compress session history + enforce MEMORY.md token budget."""
         if self.memory is None or self.sessions is None:
             return
         session_key = snapshot.session_key
@@ -185,9 +262,28 @@ class BackgroundAgent:
         self._turns_since_consolidation[session_key] = 0
         session = self.sessions.get_or_create(session_key)
         if len(session.messages) > 0:
-            logger.info("[BACKGROUND] consolidating memory for session: %s", session_key)
+            logger.info(
+                "[BACKGROUND] compressing session memory: %s", session_key
+            )
             try:
-                await self.memory.consolidate(session, archive_all=False)
-                self.sessions.save(session)
+                compressed = await self.memory.compress_session(
+                    session,
+                    provider=self.provider,
+                    model=self.model,
+                )
+                if compressed:
+                    self.sessions.save(session)
             except Exception as e:
-                logger.error("[BACKGROUND] memory consolidation error: %s", e)
+                logger.error("[BACKGROUND] compress_session error: %s", e)
+
+        # Enforce MEMORY.md budget regardless of session state
+        try:
+            mem_tokens = self.memory.long_term_token_count()
+            if mem_tokens > MEMORY_MAX_TOKENS:
+                await self.memory.archive_old_memory(
+                    provider=self.provider,
+                    model=self.model,
+                    budget_tokens=MEMORY_MAX_TOKENS,
+                )
+        except Exception as e:
+            logger.error("[BACKGROUND] archive_old_memory error: %s", e)
