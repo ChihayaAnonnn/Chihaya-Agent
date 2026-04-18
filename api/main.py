@@ -16,8 +16,10 @@ from cli.commands import _setup_logging, _run_log_file
 async def lifespan(app: FastAPI):
     verbose = os.getenv("LOG_VERBOSE", "").lower() in ("1", "true")
     _setup_logging(verbose=verbose, log_file=_run_log_file("api"))
+    registry.start_cleanup_task()
     yield
-    # Gracefully close all active sessions on shutdown
+    # Gracefully stop cleanup task and close all active sessions on shutdown
+    registry.stop_cleanup_task()
     for session_id in list(registry.list_sessions()):
         await registry.close(session_id)
 

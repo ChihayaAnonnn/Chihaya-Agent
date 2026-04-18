@@ -3,10 +3,17 @@ Global registry of active agent sessions.
 
 Each session runs AgentLoop (persona lane) + BackgroundAgent (memory/tool lane)
 as persistent asyncio tasks, mirroring the CLI `roleplay` interactive mode.
+
+TTL:
+  Sessions that have not received a message or keepalive within SESSION_TTL_S
+  (default 1800s / 30 min, configurable via SESSION_TTL env var) are automatically
+  closed by a background cleanup task started in the FastAPI lifespan.
 """
 
 import asyncio
 import logging
+import os
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -21,6 +28,9 @@ from session.manager import SessionManager
 # Maximum events buffered per session before oldest are dropped
 _LOG_QUEUE_MAXSIZE = 200
 
+# Default session TTL in seconds (overridable via SESSION_TTL env var)
+_DEFAULT_TTL_S = 1800
+
 logger = logging.getLogger(__name__)
 
 
@@ -34,9 +44,18 @@ class ActiveSession:
     bg_task: asyncio.Task
     workspace: Path
     log_queue: asyncio.Queue = field(default_factory=lambda: asyncio.Queue(maxsize=_LOG_QUEUE_MAXSIZE))
+    last_active: float = field(default_factory=time.monotonic)
+
+    def touch(self) -> None:
+        """Reset the TTL clock."""
+        self.last_active = time.monotonic()
+
+    def idle_seconds(self) -> float:
+        return time.monotonic() - self.last_active
 
     async def send(self, message: str, timeout: float = 60.0) -> str:
-        """Publish a message and wait for the agent response."""
+        """Publish a message, wait for the agent response, and update last_active."""
+        self.touch()
         channel, chat_id = "api", self.session_id
         await self.bus.publish_inbound(
             InboundMessage(
@@ -65,6 +84,54 @@ class SessionRegistry:
 
     def __init__(self) -> None:
         self._sessions: dict[str, ActiveSession] = {}
+        self._cleanup_task: asyncio.Task | None = None
+
+    # ------------------------------------------------------------------
+    # TTL cleanup
+    # ------------------------------------------------------------------
+
+    def start_cleanup_task(
+        self,
+        ttl_s: int | None = None,
+        interval_s: int = 60,
+    ) -> None:
+        """Start the background task that evicts idle sessions.
+
+        Args:
+            ttl_s: Seconds of inactivity before a session is closed.
+                   Defaults to SESSION_TTL env var or _DEFAULT_TTL_S.
+            interval_s: How often to scan for expired sessions (default 60s).
+        """
+        if self._cleanup_task is not None:
+            return  # already running
+
+        resolved_ttl = ttl_s or int(os.getenv("SESSION_TTL", str(_DEFAULT_TTL_S)))
+
+        async def _cleanup_loop() -> None:
+            logger.info("[REGISTRY] cleanup task started (ttl=%ds, interval=%ds)", resolved_ttl, interval_s)
+            while True:
+                await asyncio.sleep(interval_s)
+                await self._evict_expired(resolved_ttl)
+
+        self._cleanup_task = asyncio.create_task(_cleanup_loop(), name="session-cleanup")
+
+    async def _evict_expired(self, ttl_s: int) -> None:
+        expired = [
+            sid for sid, s in self._sessions.items()
+            if s.idle_seconds() > ttl_s
+        ]
+        for sid in expired:
+            logger.info("[REGISTRY] evicting idle session: %s (idle=%.0fs)", sid, self._sessions[sid].idle_seconds())
+            await self.close(sid)
+
+    def stop_cleanup_task(self) -> None:
+        if self._cleanup_task:
+            self._cleanup_task.cancel()
+            self._cleanup_task = None
+
+    # ------------------------------------------------------------------
+    # Session lifecycle
+    # ------------------------------------------------------------------
 
     def exists(self, session_id: str) -> bool:
         return session_id in self._sessions
@@ -72,8 +139,16 @@ class SessionRegistry:
     def get(self, session_id: str) -> ActiveSession | None:
         return self._sessions.get(session_id)
 
+    def touch(self, session_id: str) -> bool:
+        """Reset the TTL clock for a session. Returns False if not found."""
+        session = self._sessions.get(session_id)
+        if session is None:
+            return False
+        session.touch()
+        return True
+
     def create(self, session_id: str, workspace: Path, api_key: str) -> ActiveSession:
-        """Create and start a new dual-LLM session. Replaces any existing session with the same id."""
+        """Create and start a new dual-LLM session."""
         if session_id in self._sessions:
             raise ValueError(f"Session '{session_id}' already exists. Close it first.")
 
@@ -94,6 +169,7 @@ class SessionRegistry:
             prompt_holder=prompt_holder,
             ephemeral=False,
         )
+
         log_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=_LOG_QUEUE_MAXSIZE)
 
         async def _on_event(event: dict[str, Any]) -> None:

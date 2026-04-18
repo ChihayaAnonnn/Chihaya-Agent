@@ -99,6 +99,20 @@ async def send_message(
     return MessageResponse(session_id=session_id, response=response)
 
 
+@router.post("/sessions/{session_id}/keepalive")
+async def session_keepalive(session_id: str) -> dict:
+    """
+    Reset the TTL clock for a session.
+    Call periodically (e.g. every 5 minutes) to prevent automatic expiry.
+    Returns the remaining TTL in seconds based on SESSION_TTL env var (default 1800s).
+    """
+    import os
+    if not registry.touch(session_id):
+        raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found.")
+    ttl = int(os.getenv("SESSION_TTL", "1800"))
+    return {"session_id": session_id, "alive": True, "ttl_s": ttl}
+
+
 @router.get("/sessions/{session_id}/events")
 async def session_events(session_id: str, request: Request):
     """
