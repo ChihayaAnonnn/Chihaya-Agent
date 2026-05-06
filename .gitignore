@@ -11,3 +11,5 @@ workspaces/
 logs/
 
 .claude/
+.cursor/
+.vscode/
